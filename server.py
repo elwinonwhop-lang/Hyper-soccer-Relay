@@ -6,6 +6,7 @@ import random
 import websockets
 
 ROOMS = {}
+MAX_PLAYERS = 4
 
 
 def make_code():
@@ -22,7 +23,7 @@ def health_check(connection, request):
 
 async def handler(ws):
   room_code = None
-  role = None
+  slot = None
   try:
     async for raw in ws:
       msg = json.loads(raw)
@@ -30,48 +31,84 @@ async def handler(ws):
 
       if action == "create":
         room_code = make_code()
-        ROOMS[room_code] = {"host": ws, "guest": None}
-        role = "host"
-        await ws.send(json.dumps({"relay": "created", "code": room_code}))
+        ROOMS[room_code] = [ws, None, None, None]
+        slot = 0
+        await ws.send(
+            json.dumps({"relay": "created", "code": room_code, "slot": 0})
+        )
 
       elif action == "join":
         code = str(msg.get("code", "")).upper().strip()
         room = ROOMS.get(code)
         if not room:
           await ws.send(json.dumps({"relay": "error", "msg": "Room not found"}))
-        elif room["guest"] is not None and room["guest"] != ws:
-          await ws.send(json.dumps({"relay": "error", "msg": "Room is full"}))
-        else:
+        elif ws in room:
           room_code = code
-          room["guest"] = ws
-          role = "guest"
-          await ws.send(json.dumps({"relay": "joined", "code": code}))
+          slot = room.index(ws)
+          await ws.send(
+              json.dumps({"relay": "joined", "code": code, "slot": slot})
+          )
+        else:
+          open_slot = next(
+              (i for i in range(1, MAX_PLAYERS) if room[i] is None), None
+          )
+          if open_slot is None:
+            await ws.send(
+                json.dumps({"relay": "error", "msg": "Room is full (4/4)"})
+            )
+          else:
+            room_code = code
+            room[open_slot] = ws
+            slot = open_slot
+            await ws.send(
+                json.dumps({"relay": "joined", "code": code, "slot": slot})
+            )
 
-      elif room_code and room_code in ROOMS:
+      elif room_code and room_code in ROOMS and slot is not None:
         room = ROOMS[room_code]
-        target = room["guest"] if role == "host" else room["host"]
-        if target:
-          await target.send(raw)
+        if slot == 0:
+          # Host broadcasts snapshots/lobby updates to all connected guests
+          for i in range(1, MAX_PLAYERS):
+            if room[i] is not None:
+              try:
+                await room[i].send(raw)
+              except Exception:
+                pass
+        else:
+          # Guests forward their inputs to the Host, tagged with their slot ID (1, 2, or 3)
+          msg["slot"] = slot
+          tagged = json.dumps(msg, separators=(",", ":"))
+          if room[0] is not None:
+            try:
+              await room[0].send(tagged)
+            except Exception:
+              pass
 
   except websockets.ConnectionClosed:
     pass
   finally:
-    if room_code and room_code in ROOMS:
+    if room_code and room_code in ROOMS and slot is not None:
       room = ROOMS[room_code]
-      other = room["guest"] if role == "host" else room["host"]
-      if other:
-        try:
-          await other.send(
-              json.dumps(
-                  {"g": "HSOC", "t": "closed" if role == "host" else "leave"}
-              )
-          )
-        except Exception:
-          pass
-      if role == "host":
+      if slot == 0:
+        # Host disconnected: notify all guests and close the room
+        for i in range(1, MAX_PLAYERS):
+          if room[i] is not None:
+            try:
+              await room[i].send(json.dumps({"g": "HSOC", "t": "closed"}))
+            except Exception:
+              pass
         del ROOMS[room_code]
       else:
-        room["guest"] = None
+        # A guest disconnected: free their slot and tell the Host which slot left
+        if room[slot] == ws:
+          room[slot] = None
+        if room[0] is not None:
+          try:
+            await room[0].send(
+                json.dumps({"g": "HSOC", "t": "leave", "slot": slot})
+            )
+          except Exception:
+            pass
 
 
 async def main():
